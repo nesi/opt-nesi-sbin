@@ -1,0 +1,128 @@
+#!/bin/bash
+# nn_storage_quotaw
+# matt.pestle@nesi.org.nz
+# Mar 2025
+#
+# Same as nn_storage_quota, but if the file system is at 100% capacity
+# a call is made to the weka system to report on the actual usage, and also
+# the amount of time the file system has been over its soft limit.
+# The calling user must be able to run:
+#    sudo -u nesi-apps-admin <this_script>
+# So a sudo rule has to be in place for this.
+
+CONTROLLING_USER=nesi-apps-admin
+
+ME=$(id -un)
+[[ "$ME" == "$CONTROLLING_USER" ]] || {
+	bn=$(readlink -f $0)
+	sudo -u $CONTROLLING_USER $bn $*
+	exit $?
+}
+
+WEKA_USERNAME=reader
+WEKA_PASSWORD=$(< /opt/nesi/nesi-apps-admin/etc/weka_read.pw)
+export WEKA_USERNAME WEKA_PASSWORD
+WEKA_TIMEOUT=${WEKA_TIMEOUT:="5s"}
+export WEKA_HOST=10.230.0.1
+
+# If not already authenticated to weka, login:
+weka user whoami -T $WEKA_TIMEOUT -H $WEKA_HOST > /dev/null 2>&1 || {
+    if [ -n "$WEKA_ORG" ]; then
+        weka user login "$WEKA_USERNAME" "$WEKA_PASSWORD" -g $WEKA_ORG -T $WEKA_TIMEOUT -H $WEKA_HOST || {
+            echo "alert-error: weka login error"
+            exit 1
+        }
+    else
+        weka user login "$WEKA_USERNAME" "$WEKA_PASSWORD" -T $WEKA_TIMEOUT -H $WEKA_HOST || {
+            echo "alert-error: weka login error"
+            exit 1
+        }
+    fi
+}
+
+((cvt=1024*1024*1024))
+
+function weka_view() {
+	weka fs quota list --no-header -R -H $WEKA_HOST --path=$1 --all | \
+		awk '{printf("%.0f %.0f %.0f %s %s %s %s", $4,$2,$2*100/$4,$9,$10,$11,$12)}'
+}
+
+NESI_HOME=/home
+# Assumes/hardcodes /nesi/project and /nesi/nobackup as basedirs
+# for project and scratch
+
+function print_usage() {
+	echo "Usage: $0 [-h] <[-p <project>] | [-u <user>]>"
+	echo
+	echo "       -h, --help              this help message"
+	echo "       -p, --project <project> Show quota for a named project"
+	echo "       -u, --user    <user>    Show quota for a named project"
+	echo "Either -p <project> or -u <user> must be requested"
+}
+
+case "$1" in
+-h|--help|-help)
+	print_usage "help message"
+	exit 0
+	;;
+-p|--project)
+	((DO_HOME=0))
+	GROUP_LIST=$2
+	;;
+-u|--user)
+	U=$(id -un $2) || exit 1
+	((DO_HOME=1))
+	GROUP_LIST=$(id -Gn $2)
+	;;
+*)
+	print_usage "help message"
+	exit 0
+	;;
+esac
+
+HEADER="Quota_Location                    Available         Used      Use% Time_over_quota"
+
+format_string="%-34.34s%18.18s%18.18s%5.5s %-25.25s\n"
+echo "$HEADER" | awk -v format_string="$format_string" '{printf(format_string,$1,$2,$3,$4,$5)}'
+
+
+format_string="%-34.34s%18.0f%18.0f%5.0f"
+
+for d in project nobackup
+do
+
+for g in $GROUP_LIST
+do
+    ((OVER=0))
+    [[ -d "/nesi/$d/$g" ]] && {
+      	RPT=$(df --block-size=1 "/nesi/$d/$g" --output=size,used,pcent | tail -1)
+    	echo "$RPT" | awk '$1 == $2 { exit 1}; {exit 0}' || {
+    		((OVER=1))
+            RPT=$(weka_view "/nesi/$d/$g")
+        }
+       	echo ${d}_$g "$RPT" | awk -v format_string="$format_string" -v cvt=$cvt \
+            '{printf(format_string,$1,$2/cvt,$3/cvt,$4)}'
+        ((OVER)) && {
+       	    echo "$RPT" | awk '{printf(" %-25.25s",$4 " " $5 " " $6 " " $7 " " $8 " " $9)}'
+        }
+	echo
+    }
+done
+
+done
+
+((DO_HOME)) || exit 0 # Done, unless we're doing somebody's $HOME
+
+[[ -d "$NESI_HOME/$U" ]] || exit 0 # No $HOME, quit
+
+((OVER=0))
+RPT=$(df --block-size=1 "$NESI_HOME/$U" --output=size,used,pcent | tail -1)
+echo "$RPT" | awk '$1 == $2 { exit 1}; {exit 0}' || {
+    ((OVER=1))
+    RPT=$(weka_view "$NESI_HOME/$U")
+}
+echo home_$U "$RPT" | awk -v format_string="$format_string" -v cvt=$cvt \
+    '{printf(format_string,$1,$2/cvt,$3/cvt,$4)}'
+((OVER)) && {
+    echo "$RPT" | awk '{printf(" %-25.25s\n",$4 " " $5 " " $6 " " $7 " " $8 " " $9)}'
+}
