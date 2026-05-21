@@ -348,7 +348,7 @@ class QueueRow:
     start: str
     timelimit: str
     timeleft: str
-    tres: str        # squeue tres-per-node (request)
+    tres: str        # squeue tres (request)
     partition: str   # squeue %P
     nodelist: str    # squeue %N
     cpus: str        # squeue %C
@@ -368,13 +368,14 @@ def get_squeue_rows() -> List[QueueRow]:
     """
     fields = [
         ("JobID", 32),
+        ("ArrayTaskID", 32),
         ("State", 16),
         ("UserName", 32),
         ("SubmitTime", 24),
         ("StartTime", 24),
         ("TimeLimit", 16),
         ("TimeLeft", 16),
-        ("tres-per-node", 256),
+        ("tres", 256),
         ("Partition", 32),
         ("NodeList", 128),
         ("NumCPUs", 8),
@@ -391,26 +392,32 @@ def get_squeue_rows() -> List[QueueRow]:
         if not ln.strip():
             continue
         # Each field has a trailing `|`, so splitting yields N+1 parts with
-        # an empty tail; we just need the first 14.
+        # an empty tail; we just need the first 15.
         parts = ln.rstrip("\n").split("|")
-        if len(parts) < 14:
+        if len(parts) < 15:
             continue
+        jobid_raw = parts[0].strip()
+        array_task = parts[1].strip()
+        if array_task and array_task.upper() not in {"N/A", "(NULL)", "NONE", ""}:
+            jobid_display = f"{jobid_raw}_{array_task}"
+        else:
+            jobid_display = jobid_raw
         rows.append(
             QueueRow(
-                jobid=parts[0].strip(),
-                state=parts[1].strip(),
-                user=parts[2].strip(),
-                submit=parts[3].strip(),
-                start=parts[4].strip(),
-                timelimit=parts[5].strip(),
-                timeleft=parts[6].strip(),
-                tres=parts[7].strip(),
-                partition=parts[8].strip(),
-                nodelist=parts[9].strip(),
-                cpus=parts[10].strip(),
-                mem=parts[11].strip(),
-                reason=parts[12].strip(),
-                alloc_tres=parts[13].strip(),
+                jobid=jobid_display,
+                state=parts[2].strip(),
+                user=parts[3].strip(),
+                submit=parts[4].strip(),
+                start=parts[5].strip(),
+                timelimit=parts[6].strip(),
+                timeleft=parts[7].strip(),
+                tres=parts[8].strip(),
+                partition=parts[9].strip(),
+                nodelist=parts[10].strip(),
+                cpus=parts[11].strip(),
+                mem=parts[12].strip(),
+                reason=parts[13].strip(),
+                alloc_tres=parts[14].strip(),
             )
         )
     return rows
@@ -427,11 +434,21 @@ def rebucket_counts_for_row(row: QueueRow, base_counts: Dict[str, int]) -> Dict[
         out[bk] = out.get(bk, 0) + int(cnt)
     return out
 
+_TRES_SKIP_KEYS = {"cpu", "mem", "node", "billing"}
+
+def filter_tres_for_display(tres: str) -> str:
+    """Strip cpu=, mem=, node=, billing= tokens from a TRES string, leaving GPU entries."""
+    if not tres:
+        return tres
+    tokens = [t.strip() for t in tres.split(",") if t.strip()]
+    return ",".join(t for t in tokens if t.split("=")[0].lower() not in _TRES_SKIP_KEYS)
+
 def tres_with_alloc_annotation(row: QueueRow, bucket_key: str, types: Optional[List[str]]) -> str:
-    """Return row.tres, suffixed with the GPU portion of AllocTRES when the
-    request count and allocation count for `bucket_key` disagree."""
+    """Return the GPU-only portion of row.tres, suffixed with the GPU portion of
+    AllocTRES when the request count and allocation count for `bucket_key` disagree."""
+    tres_display = filter_tres_for_display(row.tres)
     if not row.alloc_tres:
-        return row.tres
+        return tres_display
 
     req_base     = parse_gpu_types_from_tres(row.tres)
     req_bucket   = filter_queue_keys_by_type(rebucket_counts_for_row(row, req_base), types)
@@ -441,17 +458,17 @@ def tres_with_alloc_annotation(row: QueueRow, bucket_key: str, types: Optional[L
     req_cnt   = int(req_bucket.get(bucket_key, 0))
     alloc_cnt = int(alloc_bucket.get(bucket_key, 0))
     if req_cnt == alloc_cnt:
-        return row.tres
+        return tres_display
 
     alloc_gpu_only = extract_gpu_only_tres(row.alloc_tres)
-    return f"{row.tres} (AllocTRES: {alloc_gpu_only})" if alloc_gpu_only else row.tres
+    return f"{tres_display} (AllocTRES: {alloc_gpu_only})" if alloc_gpu_only else tres_display
 
 # =============================================================================
 # Queue report — table rendering
 # =============================================================================
 
 # Column widths for the per-bucket job tables.
-_W_JOB    = 12
+_W_JOB    = 20
 _W_USER   = 10
 _W_STATE  = 14
 _W_PART   = 12
