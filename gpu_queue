@@ -339,6 +339,32 @@ def extract_gpu_only_tres(alloc_tres_raw: str) -> str:
 # squeue data acquisition
 # =============================================================================
 
+def count_array_tasks(array_task_str: str) -> int:
+    """Return the number of tasks in a Slurm array task ID string.
+    Handles ranges ('1-10'), steps ('1-10:2'), lists ('1,3,5-8'), and
+    single indices ('5'). Returns 1 for non-array values ('N/A', empty)."""
+    s = (array_task_str or "").strip().strip("[]")
+    if not s or s.upper() in {"N/A", "(NULL)", "NONE"}:
+        return 1
+    total = 0
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"%\d+$", "", part)  # strip Slurm concurrent-limit suffix (e.g. "1-10%2" -> "1-10")
+        if "-" in part:
+            step_parts = part.split(":", 1)
+            step = int(step_parts[1]) if len(step_parts) > 1 and step_parts[1].isdigit() else 1
+            bounds = step_parts[0].split("-", 1)
+            try:
+                lo, hi = int(bounds[0]), int(bounds[1])
+                total += max(0, (hi - lo) // step + 1)
+            except (ValueError, IndexError):
+                total += 1
+        else:
+            total += 1
+    return max(1, total)
+
 @dataclass
 class QueueRow:
     jobid: str
@@ -355,6 +381,7 @@ class QueueRow:
     mem: str         # squeue %m (may be 4G / 13500M / etc)
     reason: str
     alloc_tres: str = ""   # squeue tres-alloc (running jobs only; empty for pending)
+    array_task_count: int = 1  # number of tasks this row represents (>1 for pending array ranges)
 
 def get_squeue_rows() -> List[QueueRow]:
     """Run squeue once for all RUNNING and PENDING jobs and parse each line
@@ -400,8 +427,10 @@ def get_squeue_rows() -> List[QueueRow]:
         array_task = parts[1].strip()
         if array_task and array_task.upper() not in {"N/A", "(NULL)", "NONE", ""}:
             jobid_display = f"{jobid_raw}_{array_task}"
+            task_count = count_array_tasks(array_task)
         else:
             jobid_display = jobid_raw
+            task_count = 1
         rows.append(
             QueueRow(
                 jobid=jobid_display,
@@ -418,6 +447,7 @@ def get_squeue_rows() -> List[QueueRow]:
                 mem=parts[12].strip(),
                 reason=parts[13].strip(),
                 alloc_tres=parts[14].strip(),
+                array_task_count=task_count,
             )
         )
     return rows
@@ -763,8 +793,8 @@ def queue_report(types: Optional[List[str]]) -> None:
                 an_agg.run_rows.append((sort_key, row))
 
             elif is_pending:
-                an_agg.pending_jobs += 1
-                an_agg.pending_gpus += int(gcount)
+                an_agg.pending_jobs += row.array_task_count
+                an_agg.pending_gpus += int(gcount) * row.array_task_count
                 if start_dt is not None:
                     an_agg.pending_start_times.append(start_dt)
                 sort_key = (
