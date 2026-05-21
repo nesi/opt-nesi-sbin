@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+gpu_nodes — print a detailed per-node GPU report grouped by bucket
+(A100 40GB, A100 80GB, H100, L4), with state, CPU, memory, and per-GPU
+free/used/total counts.
+Self-contained: no external project modules.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+# =============================================================================
+# subprocess helpers
+# =============================================================================
+
+def run_text_cmd(cmd: List[str]) -> str:
+    """Run an external command and return its stdout as text. Raise RuntimeError on non-zero exit."""
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\n"
+            f"Exit code: {p.returncode}\n"
+            f"STDERR:\n{p.stderr.strip()}"
+        )
+    return p.stdout
+
+# =============================================================================
+# CLI parsing
+# =============================================================================
+
+def parse_type_arg(s: Optional[str]) -> Optional[List[str]]:
+    """Parse -t/--type as comma-separated list, e.g. a100,l4,h100,generic"""
+    if not s:
+        return None
+    items: List[str] = []
+    for tok in s.split(","):
+        t = tok.strip().lower()
+        if t:
+            items.append(t)
+    return items or None
+
+# =============================================================================
+# Node naming helpers
+# =============================================================================
+
+def natural_sort_key(s: str):
+    """Build a sort key that orders strings 'naturally' (e.g. g2 before g10) by splitting digit and non-digit runs."""
+    s = (s or "").strip()
+    parts = re.split(r"(\d+)", s)
+    key: List[Any] = []
+    for p in parts:
+        key.append(int(p) if p.isdigit() else p.lower())
+    return key
+
+def is_mg_node(node: str) -> bool:
+    """True if the node name starts with 'mg' followed by digits (the A100 80GB hosts)."""
+    return bool(re.match(r"^mg\d+", (node or "").strip(), re.IGNORECASE))
+
+def is_g_node(node: str) -> bool:
+    """True if the node name starts with 'g' followed by digits (the A100 40GB hosts)."""
+    return bool(re.match(r"^g\d+", (node or "").strip(), re.IGNORECASE))
+
+# =============================================================================
+# State helpers
+# =============================================================================
+
+def is_unavailable_state(state: str) -> bool:
+    """True if the given Slurm state means a node's GPUs should not be counted
+    as free (down/drained/draining/fail/failing/planned/maint/resv).
+
+    Normalization: lowercase and strip non-letters (so 'DRAINED*', 'drained~',
+    'drained+' all collapse to 'drained').
+    """
+    s = re.sub(r"[^a-z]", "", (state or "").strip().lower())
+    return s in {
+        "down",
+        "drained",
+        "draining",
+        "fail",
+        "failing",
+        "planned",
+        "maint",
+        "resv",
+    }
+
+# =============================================================================
+# GPU canonical keys + inventory labels
+# =============================================================================
+
+_A100_80GB_NODE_RE = re.compile(r"^mg(13|14|15|16)\b", re.IGNORECASE)
+
+def canonical_gpu_key(model: str) -> str:
+    """Map a raw GPU model string (e.g. 'NVIDIA-A100-SXM4-80GB', 'h100', 'gpu')
+    to a canonical key: 'a100', 'h100', 'l4', 'generic', or the lowercased
+    input as a fallback when no rule matches."""
+    ml = (model or "").strip().lower()
+    if "a100" in ml:
+        return "a100"
+    if "h100" in ml:
+        return "h100"
+    if re.search(r"\bl4\b", ml):
+        return "l4"
+    if ml in {"gpu", "(generic)", "generic"}:
+        return "generic"
+    return ml
+
+def gpu_display_name(node: str, model: str) -> str:
+    """Build the human-readable display label for a GPU on a given node,
+    including inferred VRAM where applicable:
+      H100              -> 'H100 (96GB)'
+      L4                -> 'L4 (24GB)'
+      A100 on mg13-16   -> 'A100 (80GB)'
+      A100 on g* nodes  -> 'A100 (40GB)'
+      A100 elsewhere    -> 'A100 (unknown VRAM)'
+    Anything else returns the model string unchanged.
+    """
+    m = (model or "").strip()
+    ml = m.lower()
+    if "h100" in ml:
+        return "H100 (96GB)"
+    if re.search(r"\bl4\b", ml):
+        return "L4 (24GB)"
+    if "a100" in ml:
+        if _A100_80GB_NODE_RE.match(node):
+            return "A100 (80GB)"
+        if is_g_node(node):
+            return "A100 (40GB)"
+        return "A100 (unknown VRAM)"
+    return m
+
+def filter_gpu_dict_by_type(gpu_counts: Dict[str, int], types: Optional[List[str]]) -> Dict[str, int]:
+    """Filter a raw {model: count} dict, keeping only entries whose canonical key
+    is in `types`. Returns the input unchanged when `types` is None/empty."""
+    if not types:
+        return gpu_counts
+    keep = set(t.lower() for t in types)
+    out: Dict[str, int] = {}
+    for model, count in (gpu_counts or {}).items():
+        if canonical_gpu_key(model) in keep:
+            out[model] = out.get(model, 0) + int(count)
+    return out
+
+def pretty_queue_key(key: str) -> str:
+    """Map an internal bucket key (a100_80, h100, generic, ...) to a human-readable label for output."""
+    k = (key or "").lower()
+    if k == "a100_80":
+        return "A100 (80GB)"
+    if k == "a100_40":
+        return "A100 (40GB)"
+    if k == "a100_unknown":
+        return "A100 (VRAM has not been specified)"
+    if k == "h100":
+        return "H100"
+    if k == "l4":
+        return "L4"
+    if k == "generic":
+        return "GPU (GPU has not been specified)"
+    return key
+
+# =============================================================================
+# Robust splitting of GRES fields (fix comma-in-parentheses bug)
+# =============================================================================
+
+def split_gres_entries(gres_field: str) -> List[str]:
+    """Split a Slurm Gres/GresUsed field on commas at depth 0, ignoring commas
+    inside parentheses (e.g. the 'IDX:0,2-3' in 'gpu:a100:4(IDX:0,2-3)').
+
+    Another example: 'gpu:a100:4(IDX:0,2-3),ssd:0' --> ['gpu:a100:4(IDX:0,2-3)', 'ssd:0']
+    """
+    s = (gres_field or "").strip()
+    if not s:
+        return []
+    out: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            if depth > 0:
+                depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            token = "".join(buf).strip()
+            if token:
+                out.append(token)
+            buf = []
+        else:
+            buf.append(ch)
+    token = "".join(buf).strip()
+    if token:
+        out.append(token)
+    return out
+
+# =============================================================================
+# sinfo inventory parsing
+# =============================================================================
+
+DEFAULT_SINFO_CMD = [
+    "sinfo",
+    "-N",
+    "--noheader",
+    "--Format=nodelist:32,Partition:24,StateLong:20,cpusState:20,Memory:12,FreeMem:12,Gres:90,GresUsed:90",
+]
+DEFAULT_SINFO_WIDTHS = [32, 24, 20, 20, 12, 12, 90, 90]
+
+_GPU_GRES_RE = re.compile(
+    r"""
+    ^\s*gpu
+    (?:
+        :(?P<model>[^:(),\s]+)
+    )?
+    (?:
+        :(?P<count>\d+)
+    )?
+    (?:\([^)]*\))?
+    \s*$
+    """,
+    re.VERBOSE,
+)
+
+def parse_fixed_width_line(line: str, widths: List[int]) -> List[str]:
+    """Slice a line into fixed-width fields and strip each one."""
+    fields: List[str] = []
+    pos = 0
+    for w in widths:
+        fields.append(line[pos:pos + w].strip())
+        pos += w
+    return fields
+
+def _safe_int(s: str, default: int = 0) -> int:
+    """int(s) but never raises; return `default` on any failure."""
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+def parse_cpu_state(cpus_state: str) -> Tuple[int, int, int, int]:
+    """Parse Slurm's 'A/I/O/T' CPU-state field into (alloc, idle, other, total). Returns 'N/A' on bad input."""
+    parts = (cpus_state or "").strip().split("/")
+    if len(parts) != 4:
+        return (0, 0, 0, 0)
+    a, i, o, t = (_safe_int(p, 'N/A') for p in parts)
+    return a, i, o, t
+
+def parse_gpu_gres_field(gres_field: str) -> Dict[str, int]:
+    """Parse a sinfo Gres/GresUsed field and return {model: count} for GPU
+    resources only. Non-GPU entries are skipped, '(null)' yields {}, and
+    untyped 'gpu' tokens are reported under the model '(generic)'."""
+    s = (gres_field or "").strip()
+    if not s or s == "(null)":
+        return {}
+    out: Dict[str, int] = {}
+    for entry in split_gres_entries(s):
+        m = _GPU_GRES_RE.match(entry.strip())
+        if not m:
+            continue
+        model = m.group("model") or "(generic)"
+        count_str = m.group("count")
+        count = 1 if count_str is None else _safe_int(count_str, 0)
+        if count <= 0:
+            continue
+        out[model] = out.get(model, 0) + count
+    return out
+
+@dataclass
+class NodeGPUInfo:
+    node: str
+    partition: str
+    state: str
+    cpu_alloc: int
+    cpu_idle: int
+    cpu_other: int
+    cpu_total: int
+    mem_total_mb: int
+    mem_free_mb: int
+    gpu_total: Dict[str, int]
+    gpu_used: Dict[str, int]
+
+    @property
+    def unavailable(self) -> bool:
+        """True if this node's state means its GPUs should not be counted as free (down/drain/maint/etc.)."""
+        return is_unavailable_state(self.state)
+
+def parse_sinfo_output(text: str) -> List[NodeGPUInfo]:
+    """Parse the multi-row, fixed-width output of DEFAULT_SINFO_CMD into a list of NodeGPUInfo records.
+    Each input row is one (node, partition) pair, so a node that lives in N partitions yields N records."""
+    lines = [ln.rstrip("\n") for ln in (text or "").splitlines() if ln.strip()]
+    nodes: List[NodeGPUInfo] = []
+    for ln in lines:
+        fields = parse_fixed_width_line(ln, DEFAULT_SINFO_WIDTHS)
+        if len(fields) < 8:
+            continue
+        node, partition, state, cpus_state, mem_total, mem_free, gres, gres_used = fields[:8]
+        gpu_total = parse_gpu_gres_field(gres)
+        gpu_used = parse_gpu_gres_field(gres_used)
+        if gpu_total == {}:
+            continue # not a gpu node, so move on
+        a, i, o, t = parse_cpu_state(cpus_state)
+        nodes.append(
+            NodeGPUInfo(
+                node=node,
+                partition=partition,
+                state=state,
+                cpu_alloc=a,
+                cpu_idle=i,
+                cpu_other=o,
+                cpu_total=t,
+                mem_total_mb=_safe_int(mem_total, -1),
+                mem_free_mb=_safe_int(mem_free, -1),
+                gpu_total=gpu_total,
+                gpu_used=gpu_used,
+            )
+        )
+    return nodes
+
+_MAINTENANCE_PARTITION_RE = re.compile(r"maint", re.IGNORECASE)
+def dedupe_nodes(nodes: List[NodeGPUInfo]) -> List[NodeGPUInfo]:
+    """Return one record per node from `parse_sinfo_output`'s rows by keeping
+    only rows whose partition is not the maintenance partition.
+
+    `sinfo -N` emits one row per (node, partition). On this cluster every GPU
+    host belongs to exactly one real partition plus the maintenance
+    partition, so dropping rows whose partition matches /maint/i
+    leaves exactly one row per node. The result is sorted naturally by node
+    name. Empty node names are skipped.
+    """
+    out: List[NodeGPUInfo] = []
+    for node in nodes:
+        #if not node.node:
+        #    continue
+        if _MAINTENANCE_PARTITION_RE.search(node.partition or ""):
+            continue
+        out.append(node)
+    out.sort(key=lambda n: natural_sort_key(n.node))
+    return out
+
+# =============================================================================
+# Memory formatting
+# =============================================================================
+
+def format_mb_as_gb(mb: int) -> str:
+    """Format an integer MB value as an 'X GB' string. Uses a whole number when
+    the value is effectively an integer count of GB, otherwise one decimal
+    place. Returns 'N/A' for unknown (-1) and '0 GB' for zero input."""
+    if mb < 0:
+        return "N/A"
+    if mb == 0:
+        return "0 GB"
+    gb = mb / 1024.0
+    if abs(gb - round(gb)) < 1e-9:
+        return f"{int(round(gb))} GB"
+    return f"{gb:.1f} GB"
+
+# =============================================================================
+# Per-node report
+# =============================================================================
+
+def _inventory_primary_bucket(node: NodeGPUInfo, types: Optional[List[str]]) -> Optional[str]:
+    """Decide which display bucket this node belongs to in the per-node report.
+    Returns one of 'a100_40', 'a100_80', 'h100', 'l4', or None.
+
+    Assume that each node only has one type of GPU.
+
+    A100 hosts that don't match the known mg13-16 (80GB) or g* (40GB) naming
+    yield None and are excluded from the per-node report. By design only these
+    four buckets are surfaced here; 'generic' and 'a100_unknown' are not.
+    """
+    total_filtered = filter_gpu_dict_by_type(node.gpu_total or {}, types)
+    if not total_filtered or not any(v > 0 for v in total_filtered.values()):
+        return None
+
+    keys_lower = [k.lower() for k in total_filtered.keys()]
+
+    if any("h100" in k for k in keys_lower):
+        return "h100"
+
+    if any(re.search(r"\bl4\b", k) for k in keys_lower):
+        return "l4"
+
+    if any("a100" in k for k in keys_lower):
+        if _A100_80GB_NODE_RE.match(node.node):
+            return "a100_80"
+        if is_g_node(node.node):
+            return "a100_40"
+        return None
+
+    return None
+
+def print_per_node_gpu_report(types: Optional[List[str]]) -> None:
+    """Print the detailed per-node GPU report, grouped by bucket (A100 40/80, H100, L4) and naturally sorted by node name.
+    Each node line shows state, CPU idle/total (with A100 site-specific CPU adjustments), free/total memory, and per-GPU counts."""
+    txt = run_text_cmd(DEFAULT_SINFO_CMD)
+    nodes = dedupe_nodes(parse_sinfo_output(txt))
+
+    gpu_nodes: List[NodeGPUInfo] = []
+    for node in nodes:
+        total_filtered = filter_gpu_dict_by_type(node.gpu_total, types)
+        if any(v > 0 for v in total_filtered.values()):
+            gpu_nodes.append(node)
+
+    print("\nGPU nodes report\n")
+    if not gpu_nodes:
+        print("No GPU nodes matched the current filters.")
+        return
+
+    groups: Dict[str, List[NodeGPUInfo]] = {"a100_40": [], "a100_80": [], "h100": [], "l4": []}
+    for node in gpu_nodes:
+        b = _inventory_primary_bucket(node, types)
+        if b in groups:
+            groups[b].append(node)
+
+    for b in groups:
+        groups[b].sort(key=lambda n: natural_sort_key(n.node))
+
+    def adjust_cpu(node_name: str, alloc: int, idle: int, other: int, total: int) -> Tuple[int, int, int, int]:
+        """Apply site-specific CPU display adjustments for the GPU nodes:
+        mg* nodes report `total - 2`; g* nodes halve all four values and subtract 4 from total.
+        Other nodes are returned unchanged."""
+        # mg nodes: show_total = true_total - 2
+        # g nodes : show_idle = true_idle/2 ; show_total = true_total/2 - 4
+        if is_mg_node(node_name):
+            return alloc, idle, other, max(total - 2, 0)
+        if is_g_node(node_name):
+            a = alloc // 2
+            i = idle // 2
+            o = other // 2
+            t = (total // 2) - 4
+            return max(a, 0), max(i, 0), max(o, 0), max(t, 0)
+        return alloc, idle, other, total
+
+    ordered_buckets = ["a100_40", "a100_80", "h100", "l4"]
+    for b in ordered_buckets:
+        if len(groups[b]) == 0:
+            continue
+
+        print(f"=== {pretty_queue_key(b)} ===\n")
+
+        for node in groups[b]:
+            status_note = ""
+            if node.unavailable:
+                status_note = "  [UNAVAILABLE: down/draining/drained/fail/planned/maint/resv — GPUs not counted as free]"
+
+            a_disp, i_disp, o_disp, t_disp = adjust_cpu(node.node, node.cpu_alloc, node.cpu_idle, node.cpu_other, node.cpu_total)
+
+            print(f"- Node: {node.node:>12}   State: {node.state}{status_note}")
+            print(f"  CPU idle/total: {i_disp}/{t_disp} (alloc {a_disp}, other {o_disp})")
+            print(f"  Mem free/total: {format_mb_as_gb(node.mem_free_mb)} / {format_mb_as_gb(node.mem_total_mb)}")
+
+            # This is needed if you just want to show a particular type of gpu on a node
+            # This is more important in the future if a node has different types of gpus
+            # attached to it
+            total_raw = filter_gpu_dict_by_type(node.gpu_total, types)
+            used_raw = filter_gpu_dict_by_type(node.gpu_used, types)
+
+            total_disp: Dict[str, int] = {}
+            used_disp: Dict[str, int] = {}
+            for model, total in total_raw.items():
+                label = gpu_display_name(node.node, model)
+                total_disp[label] = total_disp.get(label, 0) + int(total)
+            for model, used in used_raw.items():
+                label = gpu_display_name(node.node, model)
+                used_disp[label] = used_disp.get(label, 0) + int(used)
+
+            parts: List[str] = []
+            for label in sorted(set(total_disp) | set(used_disp)):
+                total = total_disp.get(label, 0)
+                used = used_disp.get(label, 0)
+                free = 0 if node.unavailable else max(total - used, 0)
+                parts.append(f"{label}: free {free} / total {total} (used {used})")
+
+            print("  GPUs: " + ("; ".join(parts) if parts else "none"))
+            print("")
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the argparse parser. Flag: -t GPU type filter."""
+    p = argparse.ArgumentParser(description="Show a detailed per-node GPU report.")
+    p.add_argument(
+        "-t",
+        "--type",
+        type=str,
+        default=None,
+        help="Comma-separated GPU types to include (e.g., a100,l4,h100,generic).",
+    )
+    return p
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Entry point: parse CLI args and print the detailed per-node GPU report."""
+    args = build_arg_parser().parse_args(argv)
+    types = parse_type_arg(args.type)
+    print_per_node_gpu_report(types=types)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

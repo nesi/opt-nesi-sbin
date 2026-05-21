@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""
+gpu_queue — print a detailed Slurm queue report broken down by GPU type.
+
+Per GPU bucket, shows running, pending, and (when present) other-state jobs
+with CPU/Memory/time/TRES details. A100 jobs are split into 80GB / 40GB /
+unknown buckets based on partition (milan/genoa) and nodelist.
+Self-contained: no external project modules.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import re
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from tqdm import tqdm
+
+# =============================================================================
+# Subprocess helpers
+# =============================================================================
+
+def run_text_cmd(cmd: List[str]) -> str:
+    """Run an external command and return its stdout as text. Raise RuntimeError on non-zero exit."""
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\n"
+            f"Exit code: {p.returncode}\n"
+            f"STDERR:\n{p.stderr.strip()}"
+        )
+    return p.stdout
+
+# =============================================================================
+# Slurm value parsing (time, duration, memory)
+# =============================================================================
+
+def parse_slurm_duration(s: str) -> Optional[timedelta]:
+    """Parse Slurm duration formats ('D-HH:MM:SS', 'HH:MM:SS', 'MM:SS', 'M') into a timedelta, or None if not parseable."""
+    if not s:
+        return None
+    ss = s.strip()
+    if ss.lower() in {"unlimited", "infinite", "n/a", "unknown", "(null)", "not_set", "not set"}:
+        return None
+
+    days = 0
+    if "-" in ss:
+        d, rest = ss.split("-", 1)
+        if d.isdigit():
+            days = int(d)
+        ss = rest
+
+    parts = ss.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, sec = (int(x) for x in parts)
+        elif len(parts) == 2:
+            h = 0
+            m, sec = (int(x) for x in parts)
+        elif len(parts) == 1:
+            h = 0
+            m = int(parts[0])
+            sec = 0
+        else:
+            return None
+        return timedelta(days=days, hours=h, minutes=m, seconds=sec)
+    except Exception:
+        return None
+
+def parse_slurm_time(s: str) -> Optional[datetime]:
+    """Parse Slurm timestamp strings (ISO-ish or 'Mon DD HH:MM[:SS]') as a UTC datetime; None if unknown/unparseable."""
+    if not s:
+        return None
+    ss = s.strip()
+    if ss.lower() in {"n/a", "unknown", "(null)"}:
+        return None
+
+    local_tz = datetime.now().astimezone().tzinfo
+
+    ss_norm = ss.replace(" ", "T")
+    try:
+        if re.search(r"\d{4}-\d{2}-\d{2}", ss_norm):
+            dt = datetime.fromisoformat(ss_norm.replace("Z", ""))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=local_tz)
+            return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in ("%b %d %H:%M", "%b %d %H:%M:%S"):
+        try:
+            dt_naive = datetime.strptime(ss, fmt)
+            dt = dt_naive.replace(year=datetime.now().year, tzinfo=local_tz)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
+_MEM_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTP]?)\s*$", re.IGNORECASE)
+def slurm_mem_to_mb(mem_str: str) -> Optional[int]:
+    """
+    Convert Slurm-like memory strings to MB.
+    Accepts: '13500M', '4G', '1024K', '1T', '500' (assumed MB), '1.5G'
+    Returns integer MB, or None if not parseable.
+    """
+    if not mem_str:
+        return None
+    s = mem_str.strip()
+    if not s or s.lower() in {"n/a", "unknown", "(null)", "not_set", "not set"}:
+        return None
+
+    m = _MEM_RE.match(s)
+    if not m:
+        return None
+
+    num = float(m.group("num"))
+    unit = (m.group("unit") or "").upper()
+
+    if unit == "" or unit == "M":
+        mb = num
+    elif unit == "K":
+        mb = num / 1024.0
+    elif unit == "G":
+        mb = num * 1024.0
+    elif unit == "T":
+        mb = num * 1024.0 * 1024.0
+    elif unit == "P":
+        mb = num * 1024.0 * 1024.0 * 1024.0
+    else:
+        return None
+
+    return int(round(mb))
+
+# =============================================================================
+# Display formatting (strings, CPU, memory)
+# =============================================================================
+
+def _truncate(s: str, width: int) -> str:
+    """Truncate `s` to fit in `width` characters, replacing the cut tail with '…' when shortened."""
+    s = (s or "")
+    if len(s) <= width:
+        return s
+    if width <= 1:
+        return s[:width]
+    return s[: max(0, width - 1)] + "…"
+
+def format_mb_as_gb(mb: int) -> str:
+    """Format an integer MB value as an 'X GB' string. Uses a whole number when
+    the value is effectively an integer count of GB, otherwise one decimal
+    place. Returns '0 GB' for zero or negative input."""
+    if mb <= 0:
+        return "0 GB"
+    gb = mb / 1024.0
+    if abs(gb - round(gb)) < 1e-9:
+        return f"{int(round(gb))} GB"
+    return f"{gb:.1f} GB"
+
+def format_slurm_mem_as_gb(mem_str: str) -> str:
+    """Format a Slurm-style memory string (e.g. '13500M', '4G') for display in GB; 'N/A' if unparseable."""
+    mb = slurm_mem_to_mb(mem_str)
+    if mb is None:
+        return "N/A"
+    return format_mb_as_gb(mb)
+
+def halve_cpu_count_str(cpus_str: str) -> str:
+    """Halve a CPU-count string, rounding up (e.g. '8' -> '4', '3' -> '2',
+    '1' -> '1'); returns 'N/A' if not an integer. Used to display physical
+    CPU counts when squeue's %C reports the hyperthread-doubled logical
+    count. Round-up matches "physical cores reserved" semantics: an odd
+    logical count still consumes a whole physical core."""
+    try:
+        return str(math.ceil(int(cpus_str.strip()) / 2))
+    except Exception:
+        return "N/A"
+
+# =============================================================================
+# GPU type canonicalization and bucketing
+# =============================================================================
+
+def canonical_gpu_key(model: str) -> str:
+    """Map a raw GPU model string (e.g. 'a100', 'h100', 'gpu')
+    to a canonical key: 'a100', 'h100', 'l4', 'generic', or the 
+    lowercased input as a fallback when no rule matches."""
+    ml = (model or "").strip().lower()
+    if "h100" in ml:
+        return "h100"
+    if "a100" in ml:
+        return "a100"
+    if re.search(r"\bl4\b", ml):
+        return "l4"
+    if ml in {"gpu", "(generic)", "generic"}:
+        return "generic"
+    return ml
+
+_A100_80GB_MG_RE = re.compile(r"\bmg(13|14|15|16)\b", re.IGNORECASE)
+_G_NODE_RE = re.compile(r"\bg\d+\b", re.IGNORECASE)
+def a100_variant_for_queue(partition: str, nodelist: str) -> str:
+    """
+    Determine A100 VRAM variant for queue bucketing.
+
+    Priority:
+      1) partition has BOTH milan and genoa -> unknown
+      2) partition has milan -> 80GB
+      3) partition has genoa -> 40GB
+      4) nodelist has mg13-16 -> 80GB
+      5) nodelist has g* -> 40GB
+      else -> unknown
+    """
+    p = (partition or "").lower()
+    has_milan = "milan" in p
+    has_genoa = "genoa" in p
+    if has_milan and has_genoa:
+        return "a100_unknown"
+    if has_milan:
+        return "a100_80"
+    if has_genoa:
+        return "a100_40"
+
+    s = (nodelist or "").lower()
+    if _A100_80GB_MG_RE.search(s):
+        return "a100_80"
+    if _G_NODE_RE.search(s) or re.search(r"\bg\[[0-9,\-]+\]", s):
+        return "a100_40"
+    return "a100_unknown"
+
+def queue_bucket_key_for_job(base_key: str, partition: str, nodelist: str) -> str:
+    """Return the queue bucket key for a job: split A100 by VRAM (80/40/unknown); pass other GPU types through unchanged."""
+    if base_key == "a100":
+        return a100_variant_for_queue(partition, nodelist)
+    return base_key
+
+def pretty_queue_key(key: str) -> str:
+    """Map an internal bucket key (a100_80, h100, generic, ...) to a human-readable label for output."""
+    k = (key or "").lower()
+    if k == "h100":
+        return "H100"
+    if k == "a100_80":
+        return "A100 (80GB)"
+    if k == "a100_40":
+        return "A100 (40GB)"
+    if k == "a100_unknown":
+        return "A100 (VRAM has not been specified)"
+    if k == "l4":
+        return "L4"
+    if k == "generic":
+        return "GPU (GPU has not been specified)"
+    return key
+
+def filter_queue_keys_by_type(keys: Dict[str, int], types: Optional[List[str]]) -> Dict[str, int]:
+    """Filter a {queue_bucket_key: count} dict by `types`. The pseudo-type 'a100'
+    matches all A100 buckets (a100_80, a100_40, a100_unknown); other types must
+    match exactly. Returns the input unchanged when `types` is None/empty."""
+    if not types:
+        return keys
+    keep = set(x.lower() for x in types)
+    out: Dict[str, int] = {}
+    for k, v in (keys or {}).items():
+        kl = (k or "").lower()
+        if kl.startswith("a100_"):
+            if "a100" in keep:
+                out[k] = out.get(k, 0) + int(v)
+        else:
+            if kl in keep:
+                out[k] = out.get(k, 0) + int(v)
+    return out
+
+# =============================================================================
+# TRES parsing (requests and allocations)
+# =============================================================================
+
+# Patterns for squeue's %b / tres-per-node field (job request).
+_GPU_PATTERNS_TRES = [
+    re.compile(r"gpu:(?P<type>[A-Za-z0-9_.-]+):(?P<count>\d+)", re.IGNORECASE),
+    re.compile(r"gres/gpu:(?P<type>[A-Za-z0-9_.-]+)=(?P<count>\d+)", re.IGNORECASE),
+    re.compile(r"gres:gpu:(?P<type>[A-Za-z0-9_.-]+)=(?P<count>\d+)", re.IGNORECASE),
+    re.compile(r"(?:gres[:/])?gpu=(?P<count>\d+)", re.IGNORECASE),
+    re.compile(r"(?:gres[:/])?gpu:(?P<count>\d+)", re.IGNORECASE),
+]
+
+def parse_gpu_types_from_tres(tres_field: str) -> Dict[str, int]:
+    """Parse a Slurm TRES string (e.g. squeue's %b field) into
+    {canonical_gpu_key: count}. Returns {} when no GPUs are requested or when
+    'gpu=0' is the only GPU spec."""
+    out: Dict[str, int] = {}
+    if not tres_field:
+        return out
+
+    s = tres_field.strip()
+    for pat in _GPU_PATTERNS_TRES:
+        for m in pat.finditer(s):
+            gd = m.groupdict()
+            cnt = int(gd.get("count") or 0)
+            if cnt <= 0:
+                continue
+            typ = gd.get("type")
+            key = canonical_gpu_key(typ) if typ else "generic"
+            out[key] = out.get(key, 0) + cnt
+
+    return out
+
+# AllocTRES typed allocations: gres/gpu:TYPE=COUNT
+_RE_ALLOCTRES_GPU_TYPED = re.compile(r"gres/gpu:(?P<type>[A-Za-z0-9_.-]+)=(?P<count>\d+)", re.IGNORECASE)
+def parse_alloc_tres_typed_gpus(alloc_tres: str) -> Dict[str, int]:
+    """Parse typed GPU allocations ('gres/gpu:TYPE=COUNT') from a sacct AllocTRES string into {canonical_key: count}."""
+    out: Dict[str, int] = {}
+    s = (alloc_tres or "").strip()
+    if not s:
+        return out
+    for m in _RE_ALLOCTRES_GPU_TYPED.finditer(s):
+        gtype = canonical_gpu_key(m.group("type"))
+        cnt = int(m.group("count"))
+        if cnt > 0:
+            out[gtype] = out.get(gtype, 0) + cnt
+    return out
+
+_GRES_GPU_PREFIX_RE = re.compile(r"^\s*gres[/:]gpu([:=])", re.IGNORECASE)
+def extract_gpu_only_tres(alloc_tres_raw: str) -> str:
+    """Extract just the GPU tokens from a Slurm AllocTRES string and normalize
+    their prefix from 'gres/gpu'/'gres:gpu' to 'gpu'. Returns the surviving
+    tokens joined by commas (e.g. 'gpu:a100=2'); '' if none are present."""
+    s = (alloc_tres_raw or "").strip()
+    if not s:
+        return ""
+
+    gpu_tokens: List[str] = []
+    for tok in (t.strip() for t in s.split(",") if t.strip()):
+        if "gpu" not in tok.lower():
+            continue
+        tok = _GRES_GPU_PREFIX_RE.sub(r"gpu\1", tok).strip()
+        if tok:
+            gpu_tokens.append(tok)
+
+    return ",".join(gpu_tokens)
+
+# =============================================================================
+# squeue data acquisition
+# =============================================================================
+
+@dataclass
+class QueueRow:
+    jobid: str
+    state: str
+    user: str
+    submit: str
+    start: str
+    timelimit: str
+    timeleft: str
+    tres: str        # squeue tres-per-node (request)
+    partition: str   # squeue %P
+    nodelist: str    # squeue %N
+    cpus: str        # squeue %C
+    mem: str         # squeue %m (may be 4G / 13500M / etc)
+    reason: str
+    alloc_tres: str = ""   # squeue tres-alloc (running jobs only; empty for pending)
+
+def get_squeue_rows() -> List[QueueRow]:
+    """Run squeue once for all RUNNING and PENDING jobs and parse each line
+    into a QueueRow.
+
+    Uses the long-form `-O` field list (rather than `-o` short codes) so we
+    can include `tres-alloc` -- AllocTRES isn't exposed via short codes.
+    Each field is given a `|` suffix to keep pipe-delimited parsing; widths
+    are generous to avoid truncation on long values (array job IDs, big
+    nodelists, verbose AllocTRES strings).
+    """
+    fields = [
+        ("JobID", 32),
+        ("State", 16),
+        ("UserName", 32),
+        ("SubmitTime", 24),
+        ("StartTime", 24),
+        ("TimeLimit", 16),
+        ("TimeLeft", 16),
+        ("tres-per-node", 256),
+        ("Partition", 32),
+        ("NodeList", 128),
+        ("NumCPUs", 8),
+        ("MinMemory", 16),
+        ("Reason", 64),
+        ("tres-alloc", 512),
+    ]
+    fmt = ",".join(f"{name}:{width}|" for name, width in fields)
+    cmd = ["squeue", "-h", "-t", "all", "-O", fmt]
+    txt = run_text_cmd(cmd)
+
+    rows: List[QueueRow] = []
+    for ln in txt.splitlines():
+        if not ln.strip():
+            continue
+        # Each field has a trailing `|`, so splitting yields N+1 parts with
+        # an empty tail; we just need the first 14.
+        parts = ln.rstrip("\n").split("|")
+        if len(parts) < 14:
+            continue
+        rows.append(
+            QueueRow(
+                jobid=parts[0].strip(),
+                state=parts[1].strip(),
+                user=parts[2].strip(),
+                submit=parts[3].strip(),
+                start=parts[4].strip(),
+                timelimit=parts[5].strip(),
+                timeleft=parts[6].strip(),
+                tres=parts[7].strip(),
+                partition=parts[8].strip(),
+                nodelist=parts[9].strip(),
+                cpus=parts[10].strip(),
+                mem=parts[11].strip(),
+                reason=parts[12].strip(),
+                alloc_tres=parts[13].strip(),
+            )
+        )
+    return rows
+
+# =============================================================================
+# Per-row helpers used by the report
+# =============================================================================
+
+def rebucket_counts_for_row(row: QueueRow, base_counts: Dict[str, int]) -> Dict[str, int]:
+    """Re-bucket a {canonical_gpu_key: count} dict for one job, applying the A100 80/40 split using its partition/nodelist."""
+    out: Dict[str, int] = {}
+    for base_k, cnt in base_counts.items():
+        bk = queue_bucket_key_for_job(base_k, row.partition, row.nodelist)
+        out[bk] = out.get(bk, 0) + int(cnt)
+    return out
+
+def tres_with_alloc_annotation(row: QueueRow, bucket_key: str, types: Optional[List[str]]) -> str:
+    """Return row.tres, suffixed with the GPU portion of AllocTRES when the
+    request count and allocation count for `bucket_key` disagree."""
+    if not row.alloc_tres:
+        return row.tres
+
+    req_base     = parse_gpu_types_from_tres(row.tres)
+    req_bucket   = filter_queue_keys_by_type(rebucket_counts_for_row(row, req_base), types)
+    alloc_typed  = parse_alloc_tres_typed_gpus(row.alloc_tres) or {}
+    alloc_bucket = filter_queue_keys_by_type(rebucket_counts_for_row(row, alloc_typed), types)
+
+    req_cnt   = int(req_bucket.get(bucket_key, 0))
+    alloc_cnt = int(alloc_bucket.get(bucket_key, 0))
+    if req_cnt == alloc_cnt:
+        return row.tres
+
+    alloc_gpu_only = extract_gpu_only_tres(row.alloc_tres)
+    return f"{row.tres} (AllocTRES: {alloc_gpu_only})" if alloc_gpu_only else row.tres
+
+# =============================================================================
+# Queue report — table rendering
+# =============================================================================
+
+# Column widths for the per-bucket job tables.
+_W_JOB    = 12
+_W_USER   = 10
+_W_STATE  = 14
+_W_PART   = 12
+_W_NODE   = 16
+_W_CPU    = 6
+_W_MEM    = 10
+_W_START  = 19
+_W_X      = 12
+_W_TRES   = 56
+_W_REASON = 22
+
+def _running_columns(bucket_key: str, types: Optional[List[str]]):
+    return [
+        ("JOBID",  _W_JOB,   lambda r: r.jobid),
+        ("USER",   _W_USER,  lambda r: r.user),
+        ("PART",   _W_PART,  lambda r: r.partition),
+        ("NODE",   _W_NODE,  lambda r: r.nodelist),
+        ("CPU",    _W_CPU,   lambda r: halve_cpu_count_str(r.cpus)),
+        ("Memory", _W_MEM,   lambda r: format_slurm_mem_as_gb(r.mem)),
+        ("START",  _W_START, lambda r: r.start),
+        ("LEFT",   _W_X,     lambda r: r.timeleft),
+        ("TRES",   _W_TRES,  lambda r: tres_with_alloc_annotation(r, bucket_key, types)),
+    ]
+
+def _pending_columns(bucket_key: str, types: Optional[List[str]]):
+    return [
+        ("JOBID",  _W_JOB,    lambda r: r.jobid),
+        ("USER",   _W_USER,   lambda r: r.user),
+        ("PART",   _W_PART,   lambda r: r.partition),
+        ("CPU",    _W_CPU,    lambda r: halve_cpu_count_str(r.cpus)),
+        ("Memory", _W_MEM,    lambda r: format_slurm_mem_as_gb(r.mem)),
+        ("START",  _W_START,  lambda r: r.start),
+        ("LIMIT",  _W_X,      lambda r: r.timelimit),
+        ("TRES",   _W_TRES,   lambda r: tres_with_alloc_annotation(r, bucket_key, types)),
+        ("REASON", _W_REASON, lambda r: r.reason),
+    ]
+
+def _other_columns(bucket_key: str, types: Optional[List[str]]):
+    return [
+        ("JOBID",  _W_JOB,   lambda r: r.jobid),
+        ("USER",   _W_USER,  lambda r: r.user),
+        ("STATE",  _W_STATE, lambda r: r.state),
+        ("PART",   _W_PART,  lambda r: r.partition),
+        ("NODE",   _W_NODE,  lambda r: r.nodelist),
+        ("CPU",    _W_CPU,   lambda r: halve_cpu_count_str(r.cpus)),
+        ("Memory", _W_MEM,   lambda r: format_slurm_mem_as_gb(r.mem)),
+        ("TRES",   _W_TRES,  lambda r: tres_with_alloc_annotation(r, bucket_key, types)),
+    ]
+
+def print_jobs_table(
+    rows: List[QueueRow],
+    columns: List[Tuple[str, int, Callable[[QueueRow], str]]],
+) -> None:
+    """Print a fixed-width job table. Each column is a (label, width, getter)
+    triple where getter(row) returns the cell's string value."""
+    if not rows:
+        return
+    header = "    " + " ".join(f"{label:<{w}}" for label, w, _ in columns)
+    print(header)
+    print("    " + "-" * (len(header) - 4))
+    for row in rows:
+        cells = " ".join(f"{_truncate(get(row), w):<{w}}" for _, w, get in columns)
+        print("    " + cells)
+
+# =============================================================================
+# Node availability via sinfo
+# =============================================================================
+
+_MAINT_PART_RE = re.compile(r"maint", re.IGNORECASE)
+
+_GPU_GRES_NODE_RE = re.compile(
+    r"""
+    ^\s*gpu
+    (?::(?P<model>[^:(),\s]+))?
+    (?::(?P<count>\d+))?
+    (?:\([^)]*\))?
+    \s*$
+    """,
+    re.VERBOSE,
+)
+
+def _split_gres_entries(gres_field: str) -> List[str]:
+    """Split a Slurm Gres field on top-level commas, ignoring commas inside parentheses."""
+    s = (gres_field or "").strip()
+    if not s:
+        return []
+    out: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            if depth > 0:
+                depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            token = "".join(buf).strip()
+            if token:
+                out.append(token)
+            buf = []
+        else:
+            buf.append(ch)
+    token = "".join(buf).strip()
+    if token:
+        out.append(token)
+    return out
+
+def _parse_gpu_gres(gres_field: str) -> Dict[str, int]:
+    """Return {model: count} for GPU entries in a Slurm Gres field; {} if none."""
+    s = (gres_field or "").strip()
+    if not s or s == "(null)":
+        return {}
+    out: Dict[str, int] = {}
+    for entry in _split_gres_entries(s):
+        m = _GPU_GRES_NODE_RE.match(entry.strip())
+        if not m:
+            continue
+        model = m.group("model") or "(generic)"
+        count_str = m.group("count")
+        try:
+            count = 1 if count_str is None else int(count_str)
+        except ValueError:
+            count = 0
+        if count <= 0:
+            continue
+        out[model] = out.get(model, 0) + count
+    return out
+
+def _is_node_unavailable(state: str) -> bool:
+    """True if the node state means GPUs cannot be scheduled (down/drained/draining/fail/planned/maint/resv)."""
+    s = re.sub(r"[^a-z]", "", (state or "").strip().lower())
+    return s in {"down", "drained", "draining", "fail", "failing", "planned", "maint", "resv"}
+
+@dataclass
+class _NodeAvail:
+    node: str
+    partition: str
+    state: str
+    gpu_total: Dict[str, int]
+
+@dataclass
+class BucketNodeStats:
+    total_gpus: int = 0
+    unavailable_gpus: int = 0
+    unavailable_nodes: List[str] = field(default_factory=list)
+
+def _get_node_avail() -> List[_NodeAvail]:
+    """Query sinfo -N and return one record per GPU node (maint partition excluded, deduplicated by node name)."""
+    cmd = ["sinfo", "-N", "--noheader",
+           "--Format=nodelist:32,Partition:24,StateLong:20,Gres:90"]
+    widths = [32, 24, 20, 90]
+    try:
+        txt = run_text_cmd(cmd)
+    except RuntimeError:
+        return []
+    seen: set = set()
+    out: List[_NodeAvail] = []
+    for ln in txt.splitlines():
+        if not ln.strip():
+            continue
+        fields: List[str] = []
+        pos = 0
+        for w in widths:
+            fields.append(ln[pos:pos + w].strip())
+            pos += w
+        if len(fields) < 4:
+            continue
+        node, partition, state, gres = fields
+        if _MAINT_PART_RE.search(partition or ""):
+            continue
+        if node in seen:
+            continue
+        seen.add(node)
+        gpu_total = _parse_gpu_gres(gres)
+        if not gpu_total:
+            continue
+        out.append(_NodeAvail(node=node, partition=partition, state=state, gpu_total=gpu_total))
+    return out
+
+def _compute_bucket_avail(nodes: List[_NodeAvail], types: Optional[List[str]]) -> Dict[str, BucketNodeStats]:
+    """Aggregate per-node GPU data into per-bucket availability stats."""
+    out: Dict[str, BucketNodeStats] = {}
+    for node in nodes:
+        for model, count in node.gpu_total.items():
+            base_key = canonical_gpu_key(model)
+            bucket = queue_bucket_key_for_job(base_key, node.partition, node.node)
+            filtered = filter_queue_keys_by_type({bucket: count}, types)
+            for bk, cnt in filtered.items():
+                stats = out.setdefault(bk, BucketNodeStats())
+                stats.total_gpus += cnt
+                if _is_node_unavailable(node.state):
+                    stats.unavailable_gpus += cnt
+                    stats.unavailable_nodes.append(f"{node.node} [{node.state}]")
+    return out
+
+# =============================================================================
+# Queue report — main
+# =============================================================================
+
+# Display order for bucket sections.
+_BUCKET_ORDER = {"h100": 0, "a100_40": 1, "a100_80": 2, "a100_unknown": 3, "l4": 4, "generic": 5}
+# Fallback "/N" suffixes used only when sinfo is unavailable.
+_BUCKET_TOTAL = {"h100": "/8", "a100_80": "/16", "a100_40": "/8", "l4": "/16"}
+
+def _bucket_sort_key(k: str):
+    """Sort key for GPU bucket display order: a100_40, a100_80, a100_unknown, h100, l4, generic, then everything else."""
+    return (_BUCKET_ORDER.get(k, 99), k)
+
+@dataclass
+class QAgg:
+    running_jobs: int = 0
+    pending_jobs: int = 0
+    other_jobs: int = 0
+    running_gpus: int = 0
+    pending_gpus: int = 0
+    other_gpus: int = 0
+    running_end_times: List[datetime] = field(default_factory=list)
+    pending_start_times: List[datetime] = field(default_factory=list)
+    run_rows: List[Tuple[Tuple[Any, ...], QueueRow]] = field(default_factory=list)
+    pend_rows: List[Tuple[Tuple[Any, ...], QueueRow]] = field(default_factory=list)
+    other_rows: List[Tuple[Tuple[Any, ...], QueueRow]] = field(default_factory=list)
+
+def queue_report(types: Optional[List[str]]) -> None:
+    """Build and print the detailed GPU queue report: per-bucket running/pending
+    counts and per-job tables for both running and pending jobs. `types`
+    filters which GPU types are included."""
+    now = datetime.now(timezone.utc)
+    rows = get_squeue_rows()
+    bucket_avail = _compute_bucket_avail(_get_node_avail(), types)
+
+    # Sentinels so jobs with missing times sort to the end.
+    BIG_DT = datetime.max.replace(tzinfo=timezone.utc)
+    BIG_TD = timedelta(days=10_000)
+
+    agg: Dict[str, QAgg] = {}
+
+    # ------------------------------------------------------------------------
+    # Phase 1: bucket every squeue row into per-GPU-type accumulators.
+    # ------------------------------------------------------------------------
+    for row in tqdm(rows, desc="Processing jobs", unit="job", leave=False):
+
+        st = (row.state or "").upper()
+        is_running = st.startswith("RUN")
+        is_pending = st.startswith("PEND")
+
+        # Requested GPUs (always available, including for pending jobs).
+        gpu_req_raw = parse_gpu_types_from_tres(row.tres)
+
+        # Allocated GPUs (running jobs only). Gives us the canonical type when
+        # the request was just "gpu" without a type.
+        gpu_alloc_raw = parse_alloc_tres_typed_gpus(row.alloc_tres) if row.alloc_tres else {}
+
+        # Skip rows with no GPU involvement at all.
+        if not gpu_req_raw and not gpu_alloc_raw:
+            continue
+
+        # When tres-per-node is absent (some jobs omit it), fall back to
+        # alloc_tres so the job still appears in the report.
+        effective_req_raw = gpu_req_raw or gpu_alloc_raw
+
+        gpu_req = rebucket_counts_for_row(row, effective_req_raw)
+        gpu_req = filter_queue_keys_by_type(gpu_req, types)
+        if not gpu_req:
+            continue
+
+        gpu_alloc = rebucket_counts_for_row(row, gpu_alloc_raw)
+        gpu_alloc = filter_queue_keys_by_type(gpu_alloc, types)
+
+        # Prefer allocation info; fall back to the request when not yet
+        # allocated (e.g. pending jobs).
+        gpu_information = gpu_alloc if gpu_alloc else gpu_req
+
+        start_dt = parse_slurm_time(row.start)
+        left_td  = parse_slurm_duration(row.timeleft)
+        limit_td = parse_slurm_duration(row.timelimit)
+
+        for gtype, gcount in gpu_information.items():
+            an_agg = agg.setdefault(gtype, QAgg())
+
+            if is_running:
+                an_agg.running_jobs += 1
+                an_agg.running_gpus += int(gcount)
+                if left_td is not None:
+                    an_agg.running_end_times.append(now + left_td)
+                sort_key = (
+                    start_dt if start_dt is not None else BIG_DT,
+                    left_td  if left_td  is not None else BIG_TD,
+                    row.jobid,
+                )
+                an_agg.run_rows.append((sort_key, row))
+
+            elif is_pending:
+                an_agg.pending_jobs += 1
+                an_agg.pending_gpus += int(gcount)
+                if start_dt is not None:
+                    an_agg.pending_start_times.append(start_dt)
+                sort_key = (
+                    start_dt if start_dt is not None else BIG_DT,
+                    limit_td if limit_td is not None else BIG_TD,
+                    row.jobid,
+                )
+                an_agg.pend_rows.append((sort_key, row))
+
+            else:
+                # Anything that is neither RUNNING nor PENDING (COMPLETING,
+                # SUSPENDED, CONFIGURING, REQUEUED, ...).
+                an_agg.other_jobs += 1
+                an_agg.other_gpus += int(gcount)
+                sort_key = (
+                    start_dt if start_dt is not None else BIG_DT,
+                    left_td  if left_td  is not None else BIG_TD,
+                    row.jobid,
+                )
+                an_agg.other_rows.append((sort_key, row))
+
+    # ------------------------------------------------------------------------
+    # Phase 2: render the report.
+    # ------------------------------------------------------------------------
+    if not agg:
+        print("No GPU jobs found in squeue (matching filters).")
+        return
+
+    print("GPU queue detailed report (per GPU type)")
+    if types:
+        print(f"  Filter: {', '.join(types)}")
+
+    for gtype in sorted(agg.keys(), key=_bucket_sort_key):
+        an_agg = agg[gtype]
+        print("")
+        print(f"{pretty_queue_key(gtype)}")
+
+        avail = bucket_avail.get(gtype)
+        if avail and avail.unavailable_gpus > 0:
+            nodes_str = ", ".join(avail.unavailable_nodes)
+            print(f"  Unavailable GPUs: {avail.unavailable_gpus}  (nodes: {nodes_str})")
+        total_suffix = f"/{avail.total_gpus}" if avail else _BUCKET_TOTAL.get(gtype, "")
+        print(f"  Running jobs: {an_agg.running_jobs} (GPUs: {an_agg.running_gpus}{total_suffix})")
+        if an_agg.run_rows:
+            an_agg.run_rows.sort(key=lambda x: x[0])
+            run_rows = [r for _, r in an_agg.run_rows]
+            print_jobs_table(run_rows, _running_columns(gtype, types))
+
+        print(f"  Pending jobs: {an_agg.pending_jobs} (GPUs: {an_agg.pending_gpus})")
+        if an_agg.pend_rows:
+            an_agg.pend_rows.sort(key=lambda x: x[0])
+            pend_rows = [r for _, r in an_agg.pend_rows]
+            print_jobs_table(pend_rows, _pending_columns(gtype, types))
+
+        # Other-state jobs (suspended, completing, configuring, requeued, ...)
+        # are only shown when present so the common case stays uncluttered.
+        if an_agg.other_jobs > 0:
+            print(f"  Other-state jobs: {an_agg.other_jobs} (GPUs: {an_agg.other_gpus})")
+            an_agg.other_rows.sort(key=lambda x: x[0])
+            other_rows = [r for _, r in an_agg.other_rows]
+            print_jobs_table(other_rows, _other_columns(gtype, types))
+
+        print("")
+
+# =============================================================================
+# CLI / main
+# =============================================================================
+
+def parse_type_arg(s: Optional[str]) -> Optional[List[str]]:
+    """Parse -t/--type as comma-separated list, e.g. a100,l4,h100,generic"""
+    if not s:
+        return None
+    items: List[str] = []
+    for tok in s.split(","):
+        t = tok.strip().lower()
+        if t:
+            items.append(t)
+    return items or None
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the argparse parser. Flag: -t GPU type filter."""
+    p = argparse.ArgumentParser(description="Show a detailed Slurm queue report broken down by GPU type.")
+    p.add_argument(
+        "-t",
+        "--type",
+        type=str,
+        default=None,
+        help="Comma-separated GPU types to include (e.g., a100,l4,h100,generic).",
+    )
+    return p
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Entry point: parse CLI args and print the detailed queue report."""
+    args = build_arg_parser().parse_args(argv)
+    types = parse_type_arg(args.type)
+    queue_report(types=types)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
