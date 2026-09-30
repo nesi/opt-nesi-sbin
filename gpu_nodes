@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 gpu_nodes — print a detailed per-node GPU report grouped by bucket
-(A100 40GB, A100 80GB, H100, L4), with state, CPU, memory, and per-GPU
+(A100 40GB, A100 80GB, H100, L4, RTX Pro 6000), with state, CPU, memory, and per-GPU
 free/used/total counts.
 Self-contained: no external project modules.
 """
@@ -34,7 +34,7 @@ def run_text_cmd(cmd: List[str]) -> str:
 # =============================================================================
 
 def parse_type_arg(s: Optional[str]) -> Optional[List[str]]:
-    """Parse -t/--type as comma-separated list, e.g. a100,l4,h100,generic"""
+    """Parse -t/--type as comma-separated list, e.g. a100,l4,h100,pro_6000,generic"""
     if not s:
         return None
     items: List[str] = []
@@ -58,12 +58,8 @@ def natural_sort_key(s: str):
     return key
 
 def is_mg_node(node: str) -> bool:
-    """True if the node name starts with 'mg' followed by digits (the A100 80GB hosts)."""
+    """True if the node name starts with 'mg' followed by digits (the milan A100 hosts)."""
     return bool(re.match(r"^mg\d+", (node or "").strip(), re.IGNORECASE))
-
-def is_g_node(node: str) -> bool:
-    """True if the node name starts with 'g' followed by digits (the A100 40GB hosts)."""
-    return bool(re.match(r"^g\d+", (node or "").strip(), re.IGNORECASE))
 
 # =============================================================================
 # State helpers
@@ -93,10 +89,11 @@ def is_unavailable_state(state: str) -> bool:
 # =============================================================================
 
 _A100_80GB_NODE_RE = re.compile(r"^mg(13|14|15|16)\b", re.IGNORECASE)
+_A100_40GB_NODE_RE = re.compile(r"^mg(17|18|19)\b", re.IGNORECASE)
 
 def canonical_gpu_key(model: str) -> str:
-    """Map a raw GPU model string (e.g. 'NVIDIA-A100-SXM4-80GB', 'h100', 'gpu')
-    to a canonical key: 'a100', 'h100', 'l4', 'generic', or the lowercased
+    """Map a raw GPU model string (e.g. 'NVIDIA-A100-SXM4-80GB', 'h100', 'pro_6000', 'gpu')
+    to a canonical key: 'a100', 'h100', 'l4', 'pro_6000', 'generic', or the lowercased
     input as a fallback when no rule matches."""
     ml = (model or "").strip().lower()
     if "a100" in ml:
@@ -105,6 +102,8 @@ def canonical_gpu_key(model: str) -> str:
         return "h100"
     if re.search(r"\bl4\b", ml):
         return "l4"
+    if "pro_6000" in ml:
+        return "pro_6000"
     if ml in {"gpu", "(generic)", "generic"}:
         return "generic"
     return ml
@@ -114,8 +113,9 @@ def gpu_display_name(node: str, model: str) -> str:
     including inferred VRAM where applicable:
       H100              -> 'H100 (96GB)'
       L4                -> 'L4 (24GB)'
+      pro_6000          -> 'RTX Pro 6000 (96GB)'
       A100 on mg13-16   -> 'A100 (80GB)'
-      A100 on g* nodes  -> 'A100 (40GB)'
+      A100 on mg17-19   -> 'A100 (40GB)'
       A100 elsewhere    -> 'A100 (unknown VRAM)'
     Anything else returns the model string unchanged.
     """
@@ -125,10 +125,12 @@ def gpu_display_name(node: str, model: str) -> str:
         return "H100 (96GB)"
     if re.search(r"\bl4\b", ml):
         return "L4 (24GB)"
+    if "pro_6000" in ml:
+        return "RTX Pro 6000 (96GB)"
     if "a100" in ml:
         if _A100_80GB_NODE_RE.match(node):
             return "A100 (80GB)"
-        if is_g_node(node):
+        if _A100_40GB_NODE_RE.match(node):
             return "A100 (40GB)"
         return "A100 (unknown VRAM)"
     return m
@@ -158,6 +160,10 @@ def pretty_queue_key(key: str) -> str:
         return "H100"
     if k == "l4":
         return "L4"
+    if k == "pro_6000":
+        return "RTX Pro 6000"
+    if k == "other":
+        return "Other GPUs (not in a known bucket)"
     if k == "generic":
         return "GPU (GPU has not been specified)"
     return key
@@ -261,8 +267,12 @@ def parse_gpu_gres_field(gres_field: str) -> Dict[str, int]:
         m = _GPU_GRES_RE.match(entry.strip())
         if not m:
             continue
-        model = m.group("model") or "(generic)"
+        model = m.group("model")
         count_str = m.group("count")
+        # Untyped 'gpu:4' lands the count in the model slot
+        if model and model.isdigit() and count_str is None:
+            model, count_str = None, model
+        model = model or "(generic)"
         count = 1 if count_str is None else _safe_int(count_str, 0)
         if count <= 0:
             continue
@@ -364,13 +374,13 @@ def format_mb_as_gb(mb: int) -> str:
 
 def _inventory_primary_bucket(node: NodeGPUInfo, types: Optional[List[str]]) -> Optional[str]:
     """Decide which display bucket this node belongs to in the per-node report.
-    Returns one of 'a100_40', 'a100_80', 'h100', 'l4', or None.
+    Returns one of 'a100_40', 'a100_80', 'h100', 'l4', 'pro_6000', or None.
 
     Assume that each node only has one type of GPU.
 
-    A100 hosts that don't match the known mg13-16 (80GB) or g* (40GB) naming
-    yield None and are excluded from the per-node report. By design only these
-    four buckets are surfaced here; 'generic' and 'a100_unknown' are not.
+    A100 hosts that don't match the known mg13-16 (80GB) or mg17-19 (40GB) naming,
+    generic GPUs, and unrecognised models yield None; the per-node report lists
+    those under the 'other' bucket.
     """
     total_filtered = filter_gpu_dict_by_type(node.gpu_total or {}, types)
     if not total_filtered or not any(v > 0 for v in total_filtered.values()):
@@ -384,17 +394,21 @@ def _inventory_primary_bucket(node: NodeGPUInfo, types: Optional[List[str]]) -> 
     if any(re.search(r"\bl4\b", k) for k in keys_lower):
         return "l4"
 
+    if any("pro_6000" in k for k in keys_lower):
+        return "pro_6000"
+
     if any("a100" in k for k in keys_lower):
         if _A100_80GB_NODE_RE.match(node.node):
             return "a100_80"
-        if is_g_node(node.node):
+        if _A100_40GB_NODE_RE.match(node.node):
             return "a100_40"
         return None
 
     return None
 
 def print_per_node_gpu_report(types: Optional[List[str]]) -> None:
-    """Print the detailed per-node GPU report, grouped by bucket (A100 40/80, H100, L4) and naturally sorted by node name.
+    """Print the detailed per-node GPU report, grouped by bucket (A100 40/80, H100, L4, RTX Pro 6000, other) and naturally sorted by node name.
+    GPU nodes that don't fit a known bucket are listed under 'other' so they aren't silently dropped.
     Each node line shows state, CPU idle/total (with A100 site-specific CPU adjustments), free/total memory, and per-GPU counts."""
     txt = run_text_cmd(DEFAULT_SINFO_CMD)
     nodes = dedupe_nodes(parse_sinfo_output(txt))
@@ -410,32 +424,23 @@ def print_per_node_gpu_report(types: Optional[List[str]]) -> None:
         print("No GPU nodes matched the current filters.")
         return
 
-    groups: Dict[str, List[NodeGPUInfo]] = {"a100_40": [], "a100_80": [], "h100": [], "l4": []}
+    groups: Dict[str, List[NodeGPUInfo]] = {"a100_40": [], "a100_80": [], "h100": [], "l4": [], "pro_6000": [], "other": []}
     for node in gpu_nodes:
         b = _inventory_primary_bucket(node, types)
-        if b in groups:
-            groups[b].append(node)
+        groups[b if b in groups else "other"].append(node)
 
     for b in groups:
         groups[b].sort(key=lambda n: natural_sort_key(n.node))
 
     def adjust_cpu(node_name: str, alloc: int, idle: int, other: int, total: int) -> Tuple[int, int, int, int]:
         """Apply site-specific CPU display adjustments for the GPU nodes:
-        mg* nodes report `total - 2`; g* nodes halve all four values and subtract 4 from total.
-        Other nodes are returned unchanged."""
+        mg* nodes report `total - 2`. Other nodes are returned unchanged."""
         # mg nodes: show_total = true_total - 2
-        # g nodes : show_idle = true_idle/2 ; show_total = true_total/2 - 4
         if is_mg_node(node_name):
             return alloc, idle, other, max(total - 2, 0)
-        if is_g_node(node_name):
-            a = alloc // 2
-            i = idle // 2
-            o = other // 2
-            t = (total // 2) - 4
-            return max(a, 0), max(i, 0), max(o, 0), max(t, 0)
         return alloc, idle, other, total
 
-    ordered_buckets = ["a100_40", "a100_80", "h100", "l4"]
+    ordered_buckets = ["a100_40", "a100_80", "h100", "l4", "pro_6000", "other"]
     for b in ordered_buckets:
         if len(groups[b]) == 0:
             continue
@@ -490,7 +495,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--type",
         type=str,
         default=None,
-        help="Comma-separated GPU types to include (e.g., a100,l4,h100,generic).",
+        help="Comma-separated GPU types to include (e.g., a100,l4,h100,pro_6000,generic).",
     )
     return p
 
