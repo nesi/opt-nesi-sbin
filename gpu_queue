@@ -4,14 +4,14 @@ gpu_queue — print a detailed Slurm queue report broken down by GPU type.
 
 Per GPU bucket, shows running, pending, and (when present) other-state jobs
 with CPU/Memory/time/TRES details. A100 jobs are split into 80GB / 40GB /
-unknown buckets based on partition (milan/genoa) and nodelist.
+unknown buckets based on nodelist (mg13-16 / mg17-19) for running jobs and
+--constraint (a100_80gb / a100_40gb) for pending jobs.
 Self-contained: no external project modules.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -165,24 +165,13 @@ def format_slurm_mem_as_gb(mem_str: str) -> str:
         return "N/A"
     return format_mb_as_gb(mb)
 
-def halve_cpu_count_str(cpus_str: str) -> str:
-    """Halve a CPU-count string, rounding up (e.g. '8' -> '4', '3' -> '2',
-    '1' -> '1'); returns 'N/A' if not an integer. Used to display physical
-    CPU counts when squeue's %C reports the hyperthread-doubled logical
-    count. Round-up matches "physical cores reserved" semantics: an odd
-    logical count still consumes a whole physical core."""
-    try:
-        return str(math.ceil(int(cpus_str.strip()) / 2))
-    except Exception:
-        return "N/A"
-
 # =============================================================================
 # GPU type canonicalization and bucketing
 # =============================================================================
 
 def canonical_gpu_key(model: str) -> str:
-    """Map a raw GPU model string (e.g. 'a100', 'h100', 'gpu')
-    to a canonical key: 'a100', 'h100', 'l4', 'generic', or the 
+    """Map a raw GPU model string (e.g. 'a100', 'h100', 'pro_6000', 'gpu')
+    to a canonical key: 'a100', 'h100', 'l4', 'pro_6000', 'generic', or the
     lowercased input as a fallback when no rule matches."""
     ml = (model or "").strip().lower()
     if "h100" in ml:
@@ -191,45 +180,92 @@ def canonical_gpu_key(model: str) -> str:
         return "a100"
     if re.search(r"\bl4\b", ml):
         return "l4"
+    if "pro_6000" in ml:
+        return "pro_6000"
     if ml in {"gpu", "(generic)", "generic"}:
         return "generic"
     return ml
 
-_A100_80GB_MG_RE = re.compile(r"\bmg(13|14|15|16)\b", re.IGNORECASE)
-_G_NODE_RE = re.compile(r"\bg\d+\b", re.IGNORECASE)
-def a100_variant_for_queue(partition: str, nodelist: str) -> str:
+_HOSTLIST_TOKEN_RE = re.compile(r"[^,\[]+(?:\[[^\]]*\][^,\[]*)*")
+def expand_hostlist(hostlist: str) -> List[str]:
+    """Expand a Slurm hostlist expression (e.g. 'mg[13-14,17],g01') into
+    individual node names. Zero-padded ranges keep their padding."""
+    out: List[str] = []
+    for token in _HOSTLIST_TOKEN_RE.findall((hostlist or "").strip()):
+        out.extend(_expand_host_token(token.strip()))
+    return out
+
+def _expand_host_token(token: str) -> List[str]:
+    """Expand one hostlist token, recursing for tokens with several bracket groups."""
+    m = re.match(r"^([^\[]*)\[([^\]]*)\](.*)$", token)
+    if not m:
+        return [token] if token else []
+    prefix, ranges, rest = m.groups()
+    suffixes = _expand_host_token(rest) or [""]
+    out: List[str] = []
+    for part in (p.strip() for p in ranges.split(",")):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        try:
+            nums = [f"{i:0{len(lo)}d}" for i in range(int(lo), int(hi or lo) + 1)]
+        except ValueError:
+            nums = [part]
+        for num in nums:
+            for suffix in suffixes:
+                out.append(f"{prefix}{num}{suffix}")
+    return out
+
+_A100_80GB_NODE_RE = re.compile(r"^mg(13|14|15|16)\b", re.IGNORECASE)
+_A100_40GB_NODE_RE = re.compile(r"^mg(17|18|19)\b", re.IGNORECASE)
+def a100_variant_for_node(node: str) -> Optional[str]:
+    """Return 'a100_80' for mg13-16, 'a100_40' for mg17-19, else None."""
+    n = (node or "").strip()
+    if _A100_80GB_NODE_RE.match(n):
+        return "a100_80"
+    if _A100_40GB_NODE_RE.match(n):
+        return "a100_40"
+    return None
+
+_A100_80GB_FEATURE_RE = re.compile(r"\ba100_80gb\b", re.IGNORECASE)
+_A100_40GB_FEATURE_RE = re.compile(r"\ba100_40gb\b", re.IGNORECASE)
+def a100_variant_for_features(features: str) -> Optional[str]:
+    """Return the A100 variant requested via --constraint ('a100_80gb' -> 'a100_80',
+    'a100_40gb' -> 'a100_40'), or None when neither, or both (e.g.
+    'a100_80gb|a100_40gb'), are named."""
+    f = features or ""
+    want_80 = bool(_A100_80GB_FEATURE_RE.search(f))
+    want_40 = bool(_A100_40GB_FEATURE_RE.search(f))
+    if want_80 == want_40:
+        return None
+    return "a100_80" if want_80 else "a100_40"
+
+def a100_variant_for_queue(nodelist: str, features: str) -> str:
     """
     Determine A100 VRAM variant for queue bucketing.
 
     Priority:
-      1) partition has BOTH milan and genoa -> unknown
-      2) partition has milan -> 80GB
-      3) partition has genoa -> 40GB
-      4) nodelist has mg13-16 -> 80GB
-      5) nodelist has g* -> 40GB
+      1) nodelist (running jobs): all A100 nodes in mg13-16 -> 80GB,
+         all A100 nodes in mg17-19 -> 40GB
+      2) --constraint (pending jobs): a100_80gb -> 80GB, a100_40gb -> 40GB
       else -> unknown
+
+    Callers pass an empty nodelist for pending jobs (see
+    rebucket_counts_for_row), so pending jobs use only the constraint.
     """
-    p = (partition or "").lower()
-    has_milan = "milan" in p
-    has_genoa = "genoa" in p
-    if has_milan and has_genoa:
-        return "a100_unknown"
-    if has_milan:
-        return "a100_80"
-    if has_genoa:
-        return "a100_40"
+    variants = {v for v in map(a100_variant_for_node, expand_hostlist(nodelist)) if v}
+    if len(variants) == 1:
+        return variants.pop()
+    return a100_variant_for_features(features) or "a100_unknown"
 
-    s = (nodelist or "").lower()
-    if _A100_80GB_MG_RE.search(s):
-        return "a100_80"
-    if _G_NODE_RE.search(s) or re.search(r"\bg\[[0-9,\-]+\]", s):
-        return "a100_40"
-    return "a100_unknown"
-
-def queue_bucket_key_for_job(base_key: str, partition: str, nodelist: str) -> str:
-    """Return the queue bucket key for a job: split A100 by VRAM (80/40/unknown); pass other GPU types through unchanged."""
+def queue_bucket_key_for_job(base_key: str, nodelist: str, features: str = "") -> str:
+    """Return the queue bucket key for a job: split A100 by VRAM (80/40/unknown).
+    An untyped GPU request with an a100_80gb/a100_40gb constraint goes to that
+    A100 bucket. Other GPU types pass through unchanged."""
     if base_key == "a100":
-        return a100_variant_for_queue(partition, nodelist)
+        return a100_variant_for_queue(nodelist, features)
+    if base_key == "generic":
+        return a100_variant_for_features(features) or base_key
     return base_key
 
 def pretty_queue_key(key: str) -> str:
@@ -245,6 +281,8 @@ def pretty_queue_key(key: str) -> str:
         return "A100 (VRAM has not been specified)"
     if k == "l4":
         return "L4"
+    if k == "pro_6000":
+        return "RTX Pro 6000"
     if k == "generic":
         return "GPU (GPU has not been specified)"
     return key
@@ -381,6 +419,7 @@ class QueueRow:
     mem: str         # squeue %m (may be 4G / 13500M / etc)
     reason: str
     alloc_tres: str = ""   # squeue tres-alloc (running jobs only; empty for pending)
+    features: str = ""     # squeue Feature (--constraint, e.g. a100_80gb)
     array_task_count: int = 1  # number of tasks this row represents (>1 for pending array ranges)
 
 def get_squeue_rows() -> List[QueueRow]:
@@ -389,6 +428,8 @@ def get_squeue_rows() -> List[QueueRow]:
 
     Uses the long-form `-O` field list (rather than `-o` short codes) so we
     can include `tres-alloc` -- AllocTRES isn't exposed via short codes.
+    `Feature` carries the job's --constraint, used to split pending A100
+    jobs into 80GB / 40GB.
     Each field is given a `|` suffix to keep pipe-delimited parsing; widths
     are generous to avoid truncation on long values (array job IDs, big
     nodelists, verbose AllocTRES strings).
@@ -409,6 +450,7 @@ def get_squeue_rows() -> List[QueueRow]:
         ("MinMemory", 16),
         ("Reason", 64),
         ("tres-alloc", 512),
+        ("Feature", 128),
     ]
     fmt = ",".join(f"{name}:{width}|" for name, width in fields)
     cmd = ["squeue", "-h", "-t", "all", "-O", fmt]
@@ -419,9 +461,9 @@ def get_squeue_rows() -> List[QueueRow]:
         if not ln.strip():
             continue
         # Each field has a trailing `|`, so splitting yields N+1 parts with
-        # an empty tail; we just need the first 15.
+        # an empty tail; we just need the first 16.
         parts = ln.rstrip("\n").split("|")
-        if len(parts) < 15:
+        if len(parts) < 16:
             continue
         jobid_raw = parts[0].strip()
         array_task = parts[1].strip()
@@ -447,6 +489,9 @@ def get_squeue_rows() -> List[QueueRow]:
                 mem=parts[12].strip(),
                 reason=parts[13].strip(),
                 alloc_tres=parts[14].strip(),
+                # Feature is last because OR'd constraints contain `|`
+                # (e.g. 'a100_80gb|a100_40gb'); rejoin everything after it.
+                features="|".join(parts[15:]).strip().rstrip("|").strip(),
                 array_task_count=task_count,
             )
         )
@@ -457,10 +502,13 @@ def get_squeue_rows() -> List[QueueRow]:
 # =============================================================================
 
 def rebucket_counts_for_row(row: QueueRow, base_counts: Dict[str, int]) -> Dict[str, int]:
-    """Re-bucket a {canonical_gpu_key: count} dict for one job, applying the A100 80/40 split using its partition/nodelist."""
+    """Re-bucket a {canonical_gpu_key: count} dict for one job, applying the A100 80/40 split using its nodelist/constraint.
+    Pending jobs ignore the nodelist, so their A100 variant comes only from the constraint."""
+    is_pending = (row.state or "").upper().startswith("PEND")
+    nodelist = "" if is_pending else row.nodelist
     out: Dict[str, int] = {}
     for base_k, cnt in base_counts.items():
-        bk = queue_bucket_key_for_job(base_k, row.partition, row.nodelist)
+        bk = queue_bucket_key_for_job(base_k, nodelist, row.features)
         out[bk] = out.get(bk, 0) + int(cnt)
     return out
 
@@ -516,7 +564,7 @@ def _running_columns(bucket_key: str, types: Optional[List[str]]):
         ("USER",   _W_USER,  lambda r: r.user),
         ("PART",   _W_PART,  lambda r: r.partition),
         ("NODE",   _W_NODE,  lambda r: r.nodelist),
-        ("CPU",    _W_CPU,   lambda r: halve_cpu_count_str(r.cpus)),
+        ("CPU",    _W_CPU,   lambda r: r.cpus),
         ("Memory", _W_MEM,   lambda r: format_slurm_mem_as_gb(r.mem)),
         ("START",  _W_START, lambda r: r.start),
         ("LEFT",   _W_X,     lambda r: r.timeleft),
@@ -528,7 +576,7 @@ def _pending_columns(bucket_key: str, types: Optional[List[str]]):
         ("JOBID",  _W_JOB,    lambda r: r.jobid),
         ("USER",   _W_USER,   lambda r: r.user),
         ("PART",   _W_PART,   lambda r: r.partition),
-        ("CPU",    _W_CPU,    lambda r: halve_cpu_count_str(r.cpus)),
+        ("CPU",    _W_CPU,    lambda r: r.cpus),
         ("Memory", _W_MEM,    lambda r: format_slurm_mem_as_gb(r.mem)),
         ("START",  _W_START,  lambda r: r.start),
         ("LIMIT",  _W_X,      lambda r: r.timelimit),
@@ -543,7 +591,7 @@ def _other_columns(bucket_key: str, types: Optional[List[str]]):
         ("STATE",  _W_STATE, lambda r: r.state),
         ("PART",   _W_PART,  lambda r: r.partition),
         ("NODE",   _W_NODE,  lambda r: r.nodelist),
-        ("CPU",    _W_CPU,   lambda r: halve_cpu_count_str(r.cpus)),
+        ("CPU",    _W_CPU,   lambda r: r.cpus),
         ("Memory", _W_MEM,   lambda r: format_slurm_mem_as_gb(r.mem)),
         ("TRES",   _W_TRES,  lambda r: tres_with_alloc_annotation(r, bucket_key, types)),
     ]
@@ -686,7 +734,7 @@ def _compute_bucket_avail(nodes: List[_NodeAvail], types: Optional[List[str]]) -
     for node in nodes:
         for model, count in node.gpu_total.items():
             base_key = canonical_gpu_key(model)
-            bucket = queue_bucket_key_for_job(base_key, node.partition, node.node)
+            bucket = queue_bucket_key_for_job(base_key, node.node)
             filtered = filter_queue_keys_by_type({bucket: count}, types)
             for bk, cnt in filtered.items():
                 stats = out.setdefault(bk, BucketNodeStats())
@@ -701,12 +749,12 @@ def _compute_bucket_avail(nodes: List[_NodeAvail], types: Optional[List[str]]) -
 # =============================================================================
 
 # Display order for bucket sections.
-_BUCKET_ORDER = {"h100": 0, "a100_40": 1, "a100_80": 2, "a100_unknown": 3, "l4": 4, "generic": 5}
+_BUCKET_ORDER = {"h100": 0, "a100_40": 1, "a100_80": 2, "a100_unknown": 3, "l4": 4, "pro_6000": 5, "generic": 6}
 # Fallback "/N" suffixes used only when sinfo is unavailable.
-_BUCKET_TOTAL = {"h100": "/8", "a100_80": "/16", "a100_40": "/8", "l4": "/16"}
+_BUCKET_TOTAL = {"h100": "/8", "a100_80": "/16", "a100_40": "/9", "l4": "/16", "pro_6000": "/8"}
 
 def _bucket_sort_key(k: str):
-    """Sort key for GPU bucket display order: a100_40, a100_80, a100_unknown, h100, l4, generic, then everything else."""
+    """Sort key for GPU bucket display order: h100, a100_40, a100_80, a100_unknown, l4, pro_6000, generic, then everything else."""
     return (_BUCKET_ORDER.get(k, 99), k)
 
 @dataclass
@@ -864,7 +912,7 @@ def queue_report(types: Optional[List[str]]) -> None:
 # =============================================================================
 
 def parse_type_arg(s: Optional[str]) -> Optional[List[str]]:
-    """Parse -t/--type as comma-separated list, e.g. a100,l4,h100,generic"""
+    """Parse -t/--type as comma-separated list, e.g. a100,l4,h100,pro_6000,generic"""
     if not s:
         return None
     items: List[str] = []
@@ -882,7 +930,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--type",
         type=str,
         default=None,
-        help="Comma-separated GPU types to include (e.g., a100,l4,h100,generic).",
+        help="Comma-separated GPU types to include (e.g., a100,l4,h100,pro_6000,generic).",
     )
     return p
 
