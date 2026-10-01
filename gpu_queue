@@ -3,7 +3,7 @@
 gpu_queue — print a detailed Slurm queue report broken down by GPU type.
 
 Per GPU bucket, shows running, pending, and (when present) other-state jobs
-with CPU/Memory/time/TRES details. A100 jobs are split into 80GB / 40GB /
+with priority/CPU/Memory/time/TRES details. A100 jobs are split into 80GB / 40GB /
 unknown buckets based on nodelist (mg13-16 / mg17-19) for running jobs and
 --constraint (a100_80gb / a100_40gb) for pending jobs.
 Self-contained: no external project modules.
@@ -419,6 +419,7 @@ class QueueRow:
     mem: str         # squeue %m (may be 4G / 13500M / etc)
     reason: str
     alloc_tres: str = ""   # squeue tres-alloc (running jobs only; empty for pending)
+    priority: str = ""     # squeue PriorityLong (integer, as shown by sprio)
     features: str = ""     # squeue Feature (--constraint, e.g. a100_80gb)
     array_task_count: int = 1  # number of tasks this row represents (>1 for pending array ranges)
 
@@ -450,6 +451,7 @@ def get_squeue_rows() -> List[QueueRow]:
         ("MinMemory", 16),
         ("Reason", 64),
         ("tres-alloc", 512),
+        ("PriorityLong", 16),
         ("Feature", 128),
     ]
     fmt = ",".join(f"{name}:{width}|" for name, width in fields)
@@ -461,9 +463,9 @@ def get_squeue_rows() -> List[QueueRow]:
         if not ln.strip():
             continue
         # Each field has a trailing `|`, so splitting yields N+1 parts with
-        # an empty tail; we just need the first 16.
+        # an empty tail; we just need the first 17.
         parts = ln.rstrip("\n").split("|")
-        if len(parts) < 16:
+        if len(parts) < 17:
             continue
         jobid_raw = parts[0].strip()
         array_task = parts[1].strip()
@@ -491,7 +493,8 @@ def get_squeue_rows() -> List[QueueRow]:
                 alloc_tres=parts[14].strip(),
                 # Feature is last because OR'd constraints contain `|`
                 # (e.g. 'a100_80gb|a100_40gb'); rejoin everything after it.
-                features="|".join(parts[15:]).strip().rstrip("|").strip(),
+                priority=parts[15].strip(),
+                features="|".join(parts[16:]).strip().rstrip("|").strip(),
                 array_task_count=task_count,
             )
         )
@@ -548,6 +551,7 @@ def tres_with_alloc_annotation(row: QueueRow, bucket_key: str, types: Optional[L
 # Column widths for the per-bucket job tables.
 _W_JOB    = 20
 _W_USER   = 10
+_W_PRIO   = 10
 _W_STATE  = 14
 _W_PART   = 12
 _W_NODE   = 16
@@ -562,6 +566,7 @@ def _running_columns(bucket_key: str, types: Optional[List[str]]):
     return [
         ("JOBID",  _W_JOB,   lambda r: r.jobid),
         ("USER",   _W_USER,  lambda r: r.user),
+        ("PRIORITY", _W_PRIO, lambda r: r.priority),
         ("PART",   _W_PART,  lambda r: r.partition),
         ("NODE",   _W_NODE,  lambda r: r.nodelist),
         ("CPU",    _W_CPU,   lambda r: r.cpus),
@@ -575,6 +580,7 @@ def _pending_columns(bucket_key: str, types: Optional[List[str]]):
     return [
         ("JOBID",  _W_JOB,    lambda r: r.jobid),
         ("USER",   _W_USER,   lambda r: r.user),
+        ("PRIORITY", _W_PRIO, lambda r: r.priority),
         ("PART",   _W_PART,   lambda r: r.partition),
         ("CPU",    _W_CPU,    lambda r: r.cpus),
         ("Memory", _W_MEM,    lambda r: format_slurm_mem_as_gb(r.mem)),
@@ -588,6 +594,7 @@ def _other_columns(bucket_key: str, types: Optional[List[str]]):
     return [
         ("JOBID",  _W_JOB,   lambda r: r.jobid),
         ("USER",   _W_USER,  lambda r: r.user),
+        ("PRIORITY", _W_PRIO, lambda r: r.priority),
         ("STATE",  _W_STATE, lambda r: r.state),
         ("PART",   _W_PART,  lambda r: r.partition),
         ("NODE",   _W_NODE,  lambda r: r.nodelist),
